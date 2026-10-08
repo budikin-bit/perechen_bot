@@ -1,0 +1,4 @@
+# Сборка каталога и разработка (парсеры .docx, тесты)
+-r requirements.txt
+python-docx>=1.1.0
+pytest>=8.0

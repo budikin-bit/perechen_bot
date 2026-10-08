@@ -1,0 +1,10 @@
+.env
+navigator.db
+navigator.db-*
+favorites.json
+certs/
+__pycache__/
+*.pyc
+.pytest_cache/
+# исходные приказы и промежуточные файлы можно не хранить в репозитории:
+*.docx

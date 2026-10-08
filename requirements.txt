@@ -1,0 +1,3 @@
+# Бот (рантайм)
+requests>=2.34.2
+python-dotenv>=1.0.0
