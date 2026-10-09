@@ -75,7 +75,16 @@ HTML_PATH = _path("HTML_PATH", "navigator.html")
 # Данные, которые должны переживать обновление кода из Git: на bothost.ru это /app/data
 # (папка не входит в синхронизацию с Git). Иначе — рядом с bot.py. Переопределяется DB_PATH / DATA_DIR.
 DATA_DIR = Path(os.environ.get("DATA_DIR") or ("/app/data" if Path("/app/data").is_dir() else BASE))
-DB_PATH = _path("DB_PATH", str(DATA_DIR / "navigator.db"))
+
+
+def _db_path() -> Path:
+    """Все базы — только в DATA_DIR. Относительный или внешний DB_PATH из окружения сводится к имени
+    файла внутри DATA_DIR (раньше «DB_PATH=navigator.db» создавал базу в корне проекта)."""
+    name = Path(os.environ.get("DB_PATH") or "navigator.db").name or "navigator.db"
+    return DATA_DIR / name
+
+
+DB_PATH = _db_path()
 ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "")) if x.strip().isdigit()}
 LEGACY_FAV_PATH = _path("FAVORITES_PATH", "favorites.json")
 CERT_DIR = _path("CERT_DIR", str(DATA_DIR / "certs" / "russian-trusted"))
@@ -898,10 +907,27 @@ def user_lock(uid: int) -> threading.Lock:
         return _ULOCKS.setdefault(uid, threading.Lock())
 
 
+def migrate_old_db(target: Path) -> None:
+    """Разово переносит базу, созданную старой версией в корне проекта, в DATA_DIR."""
+    import shutil
+    if target.exists():
+        return
+    for old in {BASE / "navigator.db", Path.cwd() / "navigator.db"}:
+        if old.exists() and old.resolve() != target.resolve():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            for suffix in ("", "-wal", "-shm"):
+                if Path(str(old) + suffix).exists():
+                    shutil.copy2(str(old) + suffix, str(target) + suffix)
+            LOG.warning("База перенесена из %s в %s", old, target)
+            return
+
+
 def init(catalog_data: Optional[dict] = None, db_path: Any = None) -> None:
     """Загружает каталог и БД (вызывается из run(); в тестах — с подставными данными)."""
     global CAT, STORE
     CAT = Catalog(catalog_data if catalog_data is not None else ensure_catalog())
+    if db_path is None:
+        migrate_old_db(DB_PATH)
     STORE = Store(db_path if db_path is not None else DB_PATH)
     STORE.import_legacy_json(LEGACY_FAV_PATH)
     STORE.remap_ids(CAT)
