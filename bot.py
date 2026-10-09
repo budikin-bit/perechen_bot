@@ -1280,6 +1280,9 @@ def handle_message(api: MaxAPI, upd: dict) -> None:
         elif cmd == "/filters":
             t, k = render_filters_menu(s)
             api.send(**target, text=t, keyboard=k)
+        elif cmd == "/myid":
+            api.send(**target, text=f"Ваш user_id: {uid}\n\nЧтобы открыть статистику, добавьте его в .env: "
+                                    f"ADMIN_IDS={uid} — и перезапустите бота.")
         elif cmd == "/stats" and uid in ADMIN_IDS:
             days = to_int(arg) if arg.isdigit() and 0 < int(arg) <= 365 else 30
             api.send(**target, text=stats_text(days))
