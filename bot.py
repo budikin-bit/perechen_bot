@@ -72,10 +72,13 @@ def _path(env: str, default: str) -> Path:
 
 CATALOG_PATH = _path("CATALOG_PATH", "catalog.json")
 HTML_PATH = _path("HTML_PATH", "navigator.html")
-DB_PATH = _path("DB_PATH", "navigator.db")
+# Данные, которые должны переживать обновление кода из Git: на bothost.ru это /app/data
+# (папка не входит в синхронизацию с Git). Иначе — рядом с bot.py. Переопределяется DB_PATH / DATA_DIR.
+DATA_DIR = Path(os.environ.get("DATA_DIR") or ("/app/data" if Path("/app/data").is_dir() else BASE))
+DB_PATH = _path("DB_PATH", str(DATA_DIR / "navigator.db"))
 ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "")) if x.strip().isdigit()}
 LEGACY_FAV_PATH = _path("FAVORITES_PATH", "favorites.json")
-CERT_DIR = _path("CERT_DIR", "certs/russian-trusted")
+CERT_DIR = _path("CERT_DIR", str(DATA_DIR / "certs" / "russian-trusted"))
 ROOT_CA = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
 SUB_CA = "https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt"
 
@@ -709,6 +712,9 @@ class Store:
 
     def __init__(self, path):
         self.lock = threading.RLock()
+        if not isinstance(path, str) or path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        LOG.info("База данных: %s", path)
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.executescript("""
             PRAGMA journal_mode=WAL;

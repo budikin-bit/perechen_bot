@@ -1,10 +1,15 @@
+
+# исходные приказы и промежуточные файлы можно не хранить в репозитории:
+*.db
+*.db-shm
+*.db-wal
+*.docx
+*.pyc
 .env
+.pytest_cache/
+__pycache__/
+certs/
+data/
+favorites.json
 navigator.db
 navigator.db-*
-favorites.json
-certs/
-__pycache__/
-*.pyc
-.pytest_cache/
-# исходные приказы и промежуточные файлы можно не хранить в репозитории:
-*.docx
