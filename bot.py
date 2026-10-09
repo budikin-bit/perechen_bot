@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -72,6 +73,7 @@ def _path(env: str, default: str) -> Path:
 CATALOG_PATH = _path("CATALOG_PATH", "catalog.json")
 HTML_PATH = _path("HTML_PATH", "navigator.html")
 DB_PATH = _path("DB_PATH", "navigator.db")
+ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "")) if x.strip().isdigit()}
 LEGACY_FAV_PATH = _path("FAVORITES_PATH", "favorites.json")
 CERT_DIR = _path("CERT_DIR", "certs/russian-trusted")
 ROOT_CA = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
@@ -234,6 +236,9 @@ def ensure_catalog() -> dict:
             data = json.loads(path.read_text(encoding="utf-8"))
             LOG.info("Каталог %s: вариант %s, событий %d", path.name,
                      data.get("variant", "unknown"), len(data.get("events", [])))
+            if data.get("variant") == "projects":
+                LOG.warning("ВНИМАНИЕ: загружен ПРОЕКТНЫЙ каталог %s — утверждённый catalog.official.json "
+                            "не найден или в .env задан CATALOG_PATH на проектный.", path.name)
             return data
     if not HTML_PATH.exists():
         raise SystemExit(
@@ -754,6 +759,31 @@ class Store:
         """Анонимно: без user_id. Нужен, чтобы видеть запросы без результатов."""
         self._q("INSERT INTO qlog VALUES(?,?,?,?)", (time.time(), kind, q[:200], n))
 
+    def stats_data(self, days: int = 30) -> dict:
+        """Агрегаты для /stats. Все данные анонимные: в qlog нет user_id."""
+        since = time.time() - days * 86400
+        with self.lock:
+            one = lambda sql, a=(): self.db.execute(sql, a).fetchone()[0]
+            allq = lambda sql, a=(): self.db.execute(sql, a).fetchall()
+            return {
+                "days": days,
+                "users_total": one("SELECT COUNT(*) FROM users"),
+                "users_active": one("SELECT COUNT(*) FROM users WHERE last_seen>=?", (since,)),
+                "users_new": one("SELECT COUNT(*) FROM users WHERE first_seen>=?", (since,)),
+                "queries": one("SELECT COUNT(*) FROM qlog WHERE kind IN ('search','org') AND ts>=?", (since,)),
+                "zero": one("SELECT COUNT(*) FROM qlog WHERE kind IN ('search','org') AND n=0 AND ts>=?", (since,)),
+                "top": allq("SELECT lower(q), COUNT(*) c FROM qlog WHERE kind IN ('search','org') AND n>0 AND ts>=? "
+                            "GROUP BY lower(q) ORDER BY c DESC, q LIMIT 10", (since,)),
+                "top_zero": allq("SELECT lower(q), COUNT(*) c FROM qlog WHERE kind IN ('search','org') AND n=0 AND ts>=? "
+                                 "GROUP BY lower(q) ORDER BY c DESC, q LIMIT 10", (since,)),
+                "filters": allq("SELECT q, COUNT(*) c FROM qlog WHERE kind='filter' AND ts>=? "
+                                "GROUP BY q ORDER BY c DESC, q LIMIT 10", (since,)),
+                "filter_keys": allq("SELECT substr(q,1,instr(q,'=')-1), COUNT(*) c FROM qlog WHERE kind='filter' AND ts>=? "
+                                    "GROUP BY 1 ORDER BY c DESC", (since,)),
+                "fav_top": allq("SELECT event_id, COUNT(*) c FROM favs GROUP BY event_id ORDER BY c DESC LIMIT 5"),
+                "fav_users": one("SELECT COUNT(DISTINCT user_id) FROM favs"),
+            }
+
     def import_legacy_json(self, path: Path) -> int:
         """Разовый перенос favorites.json → SQLite."""
         with self.lock:
@@ -869,6 +899,34 @@ def init(catalog_data: Optional[dict] = None, db_path: Any = None) -> None:
     STORE = Store(db_path if db_path is not None else DB_PATH)
     STORE.import_legacy_json(LEGACY_FAV_PATH)
     STORE.remap_ids(CAT)
+
+
+# ─────────────────────────────── статистика ───────────────────────────────
+
+def stats_text(days: int = 30) -> str:
+    d = STORE.stats_data(days)
+    L = [f"📊 Статистика за {days} дн. (анонимная)", "",
+         f"👥 Пользователей: {d['users_total']} всего, {d['users_active']} активных, {d['users_new']} новых",
+         f"🔍 Запросов: {d['queries']}, без результата: {d['zero']}"
+         + (f" ({d['zero'] * 100 // d['queries']}%)" if d["queries"] else "")]
+    def block(title, rows, fmt=lambda r: r[0]):
+        if rows:
+            L.extend(["", title] + [f"{i}. {clip(fmt(r), 60)} — {r[1]}" for i, r in enumerate(rows, 1)])
+    block("🔥 Популярные запросы:", d["top"])
+    block("🕳 Запросы без результата (что добавить в псевдонимы):", d["top_zero"])
+    if d["filter_keys"]:
+        L.extend(["", "⚙️ Фильтры по типам: " + ", ".join(
+            f"{FILTER_TITLES.get(k, k)} — {c}" for k, c in d["filter_keys"])])
+    def fname(r):
+        k, _, v = r[0].partition("=")
+        return f"{FILTER_TITLES.get(k, k)}: {v}"
+    block("⚙️ Популярные значения фильтров:", d["filters"], fname)
+    if d["fav_users"]:
+        L.extend(["", f"⭐ Избранное ведут {d['fav_users']} польз. Чаще всего:"])
+        for i, (eid, c) in enumerate(d["fav_top"], 1):
+            e = CAT.by_id.get(eid)
+            L.append(f"{i}. {clip(e['name'], 60) if e else eid} — {c}")
+    return "\n".join(L)
 
 
 # ─────────────────────────────── тексты ───────────────────────────────
@@ -1222,6 +1280,9 @@ def handle_message(api: MaxAPI, upd: dict) -> None:
         elif cmd == "/filters":
             t, k = render_filters_menu(s)
             api.send(**target, text=t, keyboard=k)
+        elif cmd == "/stats" and uid in ADMIN_IDS:
+            days = to_int(arg) if arg.isdigit() and 0 < int(arg) <= 365 else 30
+            api.send(**target, text=stats_text(days))
         elif cmd in ("/fav", "/favorites"):
             t, k = render_favorites(uid, 0)
             api.send(**target, text=t, keyboard=k)
@@ -1360,6 +1421,7 @@ def handle_callback(api: MaxAPI, upd: dict) -> None:
                 s.filters.pop(key, None)
             else:
                 s.filters[key] = val
+                STORE.log_query("filter", f"{key}={val}", 0)
         return show(*render_filter_options(s, key, to_int(p[3])))
     if head == "fs" and len(p) == 2 and p[1] in FILTER_KEYS:
         s.await_ = f"fs:{p[1]}"
