@@ -36,8 +36,8 @@ from pathlib import Path
 from typing import List
 
 from common import norm_name
-from orders import (find_order, is_header_row, is_section_row, norm_level,
-                    read_order, split_top_level, uniq)
+from orders import (find_order, image_warnings, is_header_row, is_section_row, norm_level,
+                    pad_row, read_order, split_top_level, uniq)
 
 DEFAULT_OUT = "minpros_official.json"
 MINISTRY = "Минпросвещения России"
@@ -54,6 +54,7 @@ NUM_RE = re.compile(r"^(\d+)\.(\d+)$")
 
 
 def parse_rows(rows: List[List[str]]):
+    rows = [pad_row(r) for r in rows]
     data = [r for r in rows if not is_header_row(r) and is_section_row(r) is None and any(r[1:6])]
     num_mode = any(NUM_RE.match(r[0]) for r in data)
 
@@ -152,7 +153,7 @@ def parse(path: str) -> dict:
         sys.exit(f"{path}: это приказ {order.meta.get('ministry')}, а не {MINISTRY}")
     events, sections, num_mode = parse_rows(order.rows)
     return {"meta": order.meta, "sections": sections, "numbered": num_mode,
-            "warnings": check(events, num_mode), "events": events}
+            "warnings": check(events, num_mode) + image_warnings(order), "events": events}
 
 
 def main():
@@ -173,7 +174,9 @@ def main():
         print("По разделам:", ", ".join(f"{k}: {v}" for k, v in sorted(c.items())))
     else:
         print("ℹ В документе нет номеров — присвоены 6.N по порядку (проект перечня).")
-    for w in check(ev, data["numbered"]):
+    if data["sections"]:
+        print("Заголовки разделов:", ", ".join(sorted(data["sections"])))
+    for w in data["warnings"]:
         print("⚠", w)
     Path(a.out).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Сохранено → {a.out}")

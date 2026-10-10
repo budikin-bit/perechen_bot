@@ -17,7 +17,7 @@
     а не индекс в сессии. Старые сообщения в чате не ломают новые.
   • Выдачи (VIEWS) живут в памяти; после перезапуска старые списки сообщают,
     что устарели, но карточки и избранное продолжают работать.
-  • Избранное и анонимный лог запросов — в SQLite (navigator.db).
+  • Избранное и анонимный лог запросов (хранится 90 дней, телефоны и e-mail маскируются) — в SQLite (DATA_DIR/navigator.db).
   • Сертификаты Минцифры подключаются только к сессии MAX (verify=…),
     глобальные переменные окружения не трогаются.
 Остановка: Ctrl+C.
@@ -32,11 +32,12 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import threading
 import time
 import urllib.request
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,7 +75,22 @@ CATALOG_PATH = _path("CATALOG_PATH", "catalog.json")
 HTML_PATH = _path("HTML_PATH", "navigator.html")
 # Данные, которые должны переживать обновление кода из Git: на bothost.ru это /app/data
 # (папка не входит в синхронизацию с Git). Иначе — рядом с bot.py. Переопределяется DB_PATH / DATA_DIR.
-DATA_DIR = Path(os.environ.get("DATA_DIR") or ("/app/data" if Path("/app/data").is_dir() else BASE))
+def _data_dir() -> Path:
+    """Относительный DATA_DIR считается от папки bot.py (как и прочие пути), а не от cwd."""
+    v = os.environ.get("DATA_DIR", "").strip()
+    if v:
+        p = Path(v)
+        return p if p.is_absolute() else BASE / p
+    return Path("/app/data") if Path("/app/data").is_dir() else BASE
+
+
+DATA_DIR = _data_dir()
+
+
+def _db_raw() -> Path:
+    """DB_PATH как задан в окружении (относительный — от папки bot.py)."""
+    p = Path(os.environ.get("DB_PATH") or "navigator.db")
+    return p if p.is_absolute() else BASE / p
 
 
 def _db_path() -> Path:
@@ -99,6 +115,9 @@ WORKERS = int(os.environ.get("WORKERS", "4"))
 UPDATE_TYPES = "message_created,message_callback,bot_started"
 MAX_VIEWS = 3000
 MAX_SESSIONS = 5000
+MAX_PENDING = 2000          # предупреждение в журнал, если в очередях больше обновлений
+QLOG_KEEP_DAYS = 90         # сколько дней хранить анонимный лог запросов
+SHUTDOWN_WAIT = 15          # сек.: дообработка полученных обновлений при остановке
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -167,22 +186,26 @@ def clip(s: str, n: int) -> str:
 
 
 def chunk_text(text: str, limit: int = MAX_LEN) -> List[str]:
-    """Режет по строкам; слишком длинную строку режет жёстко."""
+    """Режет по строкам; слишком длинную строку режет жёстко. Куски непустые и не длиннее limit."""
     out: List[str] = []
     buf = ""
+
+    def flush(s: str) -> None:
+        s = s.rstrip()
+        if s.strip():
+            out.append(s)
+
     for line in text.split("\n"):
         while len(line) > limit:
-            if buf:
-                out.append(buf.rstrip())
-                buf = ""
-            out.append(line[:limit])
+            flush(buf)
+            buf = ""
+            flush(line[:limit])
             line = line[limit:]
-        if len(buf) + len(line) + 1 > limit:
-            out.append(buf.rstrip())
+        if buf and len(buf) + len(line) > limit:   # buf оканчивается «\n»: итог = buf + line
+            flush(buf)
             buf = ""
         buf += line + "\n"
-    if buf.strip():
-        out.append(buf.rstrip())
+    flush(buf)
     return out or [""]
 
 
@@ -338,10 +361,14 @@ class Catalog:
                 return False
         return True
 
-    def options(self, key: str, filters: Dict[str, str], contains: str = "") -> List[str]:
+    def options(self, key: str, filters: Dict[str, str], contains: str = "",
+                interest: str = "") -> List[str]:
+        """Значения фильтра key, дающие результат при остальных фильтрах и выбранном интересе."""
         others = {k: v for k, v in filters.items() if k != key and v}
         vals = set()
         for e in self.events:
+            if interest and interest not in (e.get("interests") or []):
+                continue
             if self._match_filters(e, others):
                 vals.update(_GETTERS[key](e))
         if key == "level":
@@ -360,6 +387,8 @@ class Catalog:
         filters = filters or {}
         qs = query_stems(q) if q.strip() else []
         os_ = query_stems(org) if org.strip() else []
+        if (q.strip() and not qs) or (org.strip() and not os_):
+            return []                    # «!!!», «?», эмодзи: нет ни одного слова — не весь каталог
         scored = []
         for idx, e in enumerate(self.events):
             if interest and interest not in (e.get("interests") or []):
@@ -383,6 +412,11 @@ class Catalog:
                 scored.append((-score, idx, e))
         scored.sort(key=lambda x: (x[0], x[1]))
         return [e for _, _, e in scored]
+
+    @staticmethod
+    def has_words(q: str) -> bool:
+        """Есть ли в запросе хоть одно слово (буквы/цифры)."""
+        return bool(query_stems(q or ""))
 
     def smart_search(self, q: str, filters: Optional[Dict[str, str]] = None
                      ) -> Tuple[List[dict], bool]:
@@ -530,8 +564,12 @@ def card_text(e: dict) -> str:
     return "\n".join(L)
 
 
-def detail_pages(e: dict, limit: int = 3300) -> List[str]:
-    """Официальные данные, разбитые на страницы по длине текста."""
+DETAIL_LINE = 600
+
+
+def detail_pages(e: dict, limit: Optional[int] = None) -> List[str]:
+    """Официальные данные, разбитые на страницы. Бюджет текста = MAX_LEN минус заголовок и подпись
+    «Источник», поэтому каждая страница целиком ≤ MAX_LEN (limit может только уменьшить бюджет)."""
     lines: List[str] = []
     for r in e.get("entries") or []:
         parts = []
@@ -543,27 +581,34 @@ def detail_pages(e: dict, limit: int = 3300) -> List[str]:
             parts.append("Направление вуза: " + str(r["study_field"]))
         if r.get("level"):
             parts.append("Уровень: " + str(r["level"]))
-        if r.get("organizer"):
-            parts.append("Организатор: " + short_org(org_list(r["organizer"])[0]) if org_list(r["organizer"]) else "")
+        orgs = org_list(r["organizer"]) if r.get("organizer") else []
+        if orgs:
+            parts.append("Организатор: " + short_org(orgs[0]))
         if parts:
             lines.append("• " + " | ".join(parts))
-    footer = ("\n\nИсточник: " + e["source"]) if e.get("source") else ""
+    num = f" № {e['official_number']}" if e.get("official_number") and CAT.variant == "official" else ""
+    name = clip(e["name"], 600)
+
+    def head(i: Any, n: Any) -> str:
+        return f"📋 Официальные данные{num} · стр. {i}/{n}\n\n🏆 {name}\n\n"
+
+    footer = ("\n\nИсточник: " + clip(e["source"], 800)) if e.get("source") else ""
+    budget = MAX_LEN - len(head(999, 999)) - len(footer)     # с запасом на номера страниц
+    if limit:
+        budget = min(budget, limit)
+    line_max = max(50, min(DETAIL_LINE, budget))
     chunks: List[List[str]] = [[]]
     size = 0
     for ln in lines:
-        ln = clip(ln, 600)
-        if size + len(ln) + 1 > limit and chunks[-1]:
+        ln = clip(ln, line_max)
+        add = len(ln) + (1 if chunks[-1] else 0)               # строки соединяются «\n»
+        if size + add > budget and chunks[-1]:
             chunks.append([])
-            size = 0
+            size, add = 0, len(ln)
         chunks[-1].append(ln)
-        size += len(ln) + 1
+        size += add
     n = len(chunks)
-    out = []
-    for i, ch in enumerate(chunks):
-        num = f" № {e['official_number']}" if e.get("official_number") and CAT.variant == "official" else ""
-        head = f"📋 Официальные данные{num} · стр. {i + 1}/{n}\n\n🏆 {e['name']}\n\n"
-        out.append(head + "\n".join(ch) + footer)
-    return out
+    return [head(i + 1, n) + "\n".join(ch) + footer for i, ch in enumerate(chunks)]
 
 
 # ──────────────────────────────── MAX API ────────────────────────────────
@@ -770,9 +815,24 @@ class Store:
     def remove(self, uid: int, eid: str) -> None:
         self._q("DELETE FROM favs WHERE user_id=? AND event_id=?", (uid, eid))
 
+    @staticmethod
+    def norm_query(q: str) -> str:
+        """Нормализация в Python: SQLite lower() не понижает кириллицу."""
+        q = re.sub(r"\S+@\S+", "<email>", q or "")                       # e-mail
+        q = re.sub(r"\+?\d[\d\s()\-]{5,}\d", "<номер>", q)              # телефоны и длинные номера
+        return " ".join(q.split()).casefold()[:200]
+
     def log_query(self, kind: str, q: str, n: int) -> None:
         """Анонимно: без user_id. Нужен, чтобы видеть запросы без результатов."""
-        self._q("INSERT INTO qlog VALUES(?,?,?,?)", (time.time(), kind, q[:200], n))
+        q = self.norm_query(q) if kind in ("search", "org") else (q or "")[:200]
+        self._q("INSERT INTO qlog VALUES(?,?,?,?)", (time.time(), kind, q, n))
+
+    def purge_qlog(self, days: int = QLOG_KEEP_DAYS) -> int:
+        """Удаляет записи лога запросов старше days дней (вызывается при запуске)."""
+        n = self._q("DELETE FROM qlog WHERE ts<?", (time.time() - days * 86400,)).rowcount
+        if n:
+            LOG.info("Лог запросов: удалено записей старше %d дн.: %d", days, n)
+        return n
 
     def stats_data(self, days: int = 30) -> dict:
         """Агрегаты для /stats. Все данные анонимные: в qlog нет user_id."""
@@ -787,10 +847,10 @@ class Store:
                 "users_new": one("SELECT COUNT(*) FROM users WHERE first_seen>=?", (since,)),
                 "queries": one("SELECT COUNT(*) FROM qlog WHERE kind IN ('search','org') AND ts>=?", (since,)),
                 "zero": one("SELECT COUNT(*) FROM qlog WHERE kind IN ('search','org') AND n=0 AND ts>=?", (since,)),
-                "top": allq("SELECT lower(q), COUNT(*) c FROM qlog WHERE kind IN ('search','org') AND n>0 AND ts>=? "
-                            "GROUP BY lower(q) ORDER BY c DESC, q LIMIT 10", (since,)),
-                "top_zero": allq("SELECT lower(q), COUNT(*) c FROM qlog WHERE kind IN ('search','org') AND n=0 AND ts>=? "
-                                 "GROUP BY lower(q) ORDER BY c DESC, q LIMIT 10", (since,)),
+                "top": allq("SELECT q, COUNT(*) c FROM qlog WHERE kind IN ('search','org') AND n>0 AND ts>=? "
+                            "GROUP BY q ORDER BY c DESC, q LIMIT 10", (since,)),
+                "top_zero": allq("SELECT q, COUNT(*) c FROM qlog WHERE kind IN ('search','org') AND n=0 AND ts>=? "
+                                 "GROUP BY q ORDER BY c DESC, q LIMIT 10", (since,)),
                 "filters": allq("SELECT q, COUNT(*) c FROM qlog WHERE kind='filter' AND ts>=? "
                                 "GROUP BY q ORDER BY c DESC, q LIMIT 10", (since,)),
                 "filter_keys": allq("SELECT substr(q,1,instr(q,'=')-1), COUNT(*) c FROM qlog WHERE kind='filter' AND ts>=? "
@@ -843,9 +903,24 @@ class Store:
 @dataclass
 class Session:
     await_: Optional[str] = None
+    await_chat: Optional[int] = None      # чат, где бот попросил ввести текст
     filters: Dict[str, str] = field(default_factory=dict)
     interest: str = ""
     fquery: str = ""
+
+    def expect(self, what: Optional[str], chat: Optional[int] = None) -> None:
+        """Ждём текст (what) именно в этом чате; None — ничего не ждём."""
+        self.await_, self.await_chat = what, (chat if what else None)
+
+    def awaiting_in(self, chat: Optional[int], in_group: bool) -> Optional[str]:
+        """Что ждём от текста из чата chat. Ожидание из другого чата не срабатывает."""
+        if not self.await_:
+            return None
+        if self.await_chat == chat:
+            return self.await_
+        if self.await_chat is None and not in_group:     # чат запроса неизвестен — только личка
+            return self.await_
+        return None
 
 
 class LRU:
@@ -868,28 +943,36 @@ class LRU:
 
 
 class Views:
-    """Результаты поиска: view_id → {title, ids, note}. id уникален между запусками."""
+    """Результаты поиска: view_id → {title, ids, note, owner}.
+    Префикс запуска случайный (32 бита), поэтому id не повторяются между перезапусками;
+    выдача привязана к пользователю — чужой или безымянный запрос видит её «устаревшей»."""
 
     def __init__(self, cap: int = MAX_VIEWS):
         self.lru = LRU(cap)
-        self.boot = b36(int(time.time()) % 1296).rjust(2, "0")
+        self.boot = b36(secrets.randbits(32)).rjust(7, "0")
         self.counter = itertools.count(1)
 
-    def new(self, title: str, ids: List[str], note: str = "") -> str:
+    def new(self, title: str, ids: List[str], note: str = "", owner: Optional[int] = None) -> str:
         vid = f"{self.boot}{b36(next(self.counter))}"
-        self.lru.put(vid, {"title": title, "ids": ids, "note": note})
+        self.lru.put(vid, {"title": title, "ids": ids, "note": note, "owner": owner})
         return vid
 
-    def get(self, vid: str) -> Optional[dict]:
-        return self.lru.get(vid)
+    def get(self, vid: str, uid: Optional[int] = None) -> Optional[dict]:
+        v = self.lru.get(vid)
+        if v is None or uid is None or v.get("owner") != uid:
+            return None
+        return v
+
+    def foreign(self, vid: str, uid: Optional[int]) -> bool:
+        """Выдача существует, но принадлежит другому пользователю."""
+        v = self.lru.get(vid)
+        return v is not None and v.get("owner") != uid
 
 
 CAT: Catalog
 STORE: Store
 VIEWS = Views()
 SESSIONS = LRU(MAX_SESSIONS)
-_ULOCKS: Dict[int, threading.Lock] = {}
-_ULOCKS_GUARD = threading.Lock()
 
 
 def sess(uid: int) -> Session:
@@ -900,26 +983,58 @@ def sess(uid: int) -> Session:
     return s
 
 
-def user_lock(uid: int) -> threading.Lock:
-    with _ULOCKS_GUARD:
-        if len(_ULOCKS) > 20000:
-            _ULOCKS.clear()
-        return _ULOCKS.setdefault(uid, threading.Lock())
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
 
 
-def migrate_old_db(target: Path) -> None:
-    """Разово переносит базу, созданную старой версией в корне проекта, в DATA_DIR."""
+def migrate_old_db(target: Path, raw: Optional[Path] = None) -> Optional[Path]:
+    """Разово переносит базу, созданную старой версией вне DATA_DIR, в DATA_DIR.
+    Ищет: DB_PATH как задан → BASE/<имя> → cwd/<имя> → BASE/navigator.db → cwd/navigator.db.
+    Перед копированием переносит журнал WAL в основной файл (wal_checkpoint)."""
     import shutil
     if target.exists():
-        return
-    for old in {BASE / "navigator.db", Path.cwd() / "navigator.db"}:
-        if old.exists() and old.resolve() != target.resolve():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            for suffix in ("", "-wal", "-shm"):
-                if Path(str(old) + suffix).exists():
-                    shutil.copy2(str(old) + suffix, str(target) + suffix)
-            LOG.warning("База перенесена из %s в %s", old, target)
-            return
+        return None
+    raw = raw if raw is not None else _db_raw()
+    name = target.name
+    cands: List[Path] = []
+    for c in (raw, BASE / name, Path.cwd() / name, BASE / "navigator.db", Path.cwd() / "navigator.db"):
+        if all(not _same_file(c, x) for x in cands):
+            cands.append(c)
+    for old in cands:
+        if not old.is_file() or _same_file(old, target):
+            continue
+        if Path(str(old) + "-wal").exists():
+            try:
+                con = sqlite3.connect(str(old))
+                try:
+                    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                finally:
+                    con.close()
+            except Exception as ex:  # noqa: BLE001
+                LOG.warning("Не удалось выполнить checkpoint для %s: %s — копирую как есть", old, ex)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for suffix in ("", "-wal", "-shm"):
+            if Path(str(old) + suffix).exists():
+                shutil.copy2(str(old) + suffix, str(target) + suffix)
+        LOG.warning("База перенесена из %s в %s", old, target)
+        return old
+    return None
+
+
+def warn_db_redirect(target: Path, raw: Optional[Path] = None) -> bool:
+    """Предупреждение, если DB_PATH указывал на другую папку, а база всё равно в DATA_DIR."""
+    env = os.environ.get("DB_PATH") or ""
+    if not env or Path(env).name == env:          # только имя файла — штатный случай
+        return False
+    raw = raw if raw is not None else _db_raw()
+    if _same_file(raw, target):
+        return False
+    LOG.warning("DB_PATH=%s указывает вне DATA_DIR — база хранится в %s "
+                "(все базы — только в DATA_DIR)", env, target)
+    return True
 
 
 def init(catalog_data: Optional[dict] = None, db_path: Any = None) -> None:
@@ -927,8 +1042,10 @@ def init(catalog_data: Optional[dict] = None, db_path: Any = None) -> None:
     global CAT, STORE
     CAT = Catalog(catalog_data if catalog_data is not None else ensure_catalog())
     if db_path is None:
+        warn_db_redirect(DB_PATH)
         migrate_old_db(DB_PATH)
     STORE = Store(db_path if db_path is not None else DB_PATH)
+    STORE.purge_qlog()
     STORE.import_legacy_json(LEGACY_FAV_PATH)
     STORE.remap_ids(CAT)
 
@@ -959,6 +1076,34 @@ def stats_text(days: int = 30) -> str:
             e = CAT.by_id.get(eid)
             L.append(f"{i}. {clip(e['name'], 60) if e else eid} — {c}")
     return "\n".join(L)
+
+
+_DAYS_RE = re.compile(r"^\d{1,3}$")
+
+
+def stats_days(arg: str) -> int:
+    """«/stats N»: 1…365 дней, иначе 30. Только ASCII-цифры («²».isdigit() — тоже True)."""
+    arg = (arg or "").strip()
+    if _DAYS_RE.match(arg) and arg.isascii():
+        n = int(arg)
+        if 1 <= n <= 365:
+            return n
+    return 30
+
+
+def send_stats(api: "MaxAPI", target: dict, uid: int, arg: str, in_group: bool) -> None:
+    """В группе статистику не публикуем: отправляем админу в личный чат, в группе — короткая заметка."""
+    text = stats_text(stats_days(arg))
+    if not in_group:
+        api.send(**target, text=text)
+        return
+    try:
+        api.send(user_id=uid, text=text)
+        note = "📊 Статистика отправлена вам в личный чат с ботом."
+    except Exception as ex:  # noqa: BLE001
+        LOG.warning("не удалось отправить /stats в личку: %s", ex)
+        note = "📊 Статистика доступна только в личном чате с ботом."
+    api.send(**target, text=note)
 
 
 # ─────────────────────────────── тексты ───────────────────────────────
@@ -1024,8 +1169,8 @@ def pager(prefix: str, page: int, pages: int) -> List[Tuple]:
     return nav
 
 
-def render_list(vid: str, page: int) -> Tuple[str, dict]:
-    v = VIEWS.get(vid)
+def render_list(vid: str, page: int, uid: Optional[int] = None) -> Tuple[str, dict]:
+    v = VIEWS.get(vid, uid)
     if not v:
         return EXPIRED_TEXT, kb([[("🔍 Новый поиск", "m:search"), ("🏠 Меню", "m:menu")]])
     ids = v["ids"]
@@ -1066,7 +1211,7 @@ def render_card(uid: int, eid: str, vid: str, lpage: int) -> Tuple[str, dict]:
     fav = STORE.is_fav(uid, eid)
     if vid == "f":
         back = ("⬅ К избранному", f"l:f:{lpage}")
-    elif VIEWS.get(vid):
+    elif VIEWS.get(vid, uid):
         back = ("⬅ К списку", f"l:{vid}:{lpage}")
     else:
         back = ("🔍 Новый поиск", "m:search")
@@ -1131,24 +1276,30 @@ def render_interests(s: Session) -> Tuple[str, dict]:
 
 def render_filters_menu(s: Session) -> Tuple[str, dict]:
     L = ["⚙️ Фильтры", ""]
+    if s.interest:          # интерес тоже сужает подборку — показываем его явно
+        L += [f"🎯 Интерес: {s.interest}", ""]
     active = [k for k in FILTER_KEYS if s.filters.get(k)]
     if active:
         L += [f"• {FILTER_TITLES[k]}: {s.filters[k]}" for k in active] + [""]
     else:
         L.append("Фильтры не заданы.\n")
     rows = [[(("✅ " if s.filters.get(k) else "") + FILTER_TITLES[k], f"fk:{k}")] for k in FILTER_KEYS]
+    if s.interest:
+        rows.append([(clip(f"✖️ Сбросить интерес «{s.interest}»", 60), "fx:interest")])
     rows.append([("▶️ Показать результаты", "fshow")])
     rows.append([("♻️ Сбросить всё", "fclear"), ("🏠 Меню", "m:menu")])
     return "\n".join(L).rstrip(), kb(rows)
 
 
 def render_filter_options(s: Session, key: str, page: int) -> Tuple[str, dict]:
-    opts = CAT.options(key, s.filters, s.fquery)
+    opts = CAT.options(key, s.filters, s.fquery, s.interest)
     pages = max(1, (len(opts) + OPT_PAGE - 1) // OPT_PAGE)
     page = max(0, min(page, pages - 1))
     chunk = opts[page * OPT_PAGE: (page + 1) * OPT_PAGE]
     cur = s.filters.get(key)
     L = [f"⚙️ {FILTER_TITLES[key]}", f"Вариантов: {len(opts)} · стр. {page + 1}/{pages}"]
+    if s.interest:
+        L.append(f"🎯 С учётом интереса: {s.interest}")
     if s.fquery:
         L.append(f"🔎 Поиск по списку: «{clip(s.fquery, 40)}»")
     L.append("")
@@ -1170,16 +1321,20 @@ def render_filter_options(s: Session, key: str, page: int) -> Tuple[str, dict]:
 # ──────────────────────────── поисковые сценарии ────────────────────────────
 
 NO_RESULT_KB = kb([[("⚙️ Фильтры", "m:filters"), ("♻️ Сбросить", "fclear")], [("🏠 Меню", "m:menu")]])
+NO_WORDS_TEXT = "✍️ Напишите слово: название, предмет или вуз."
 
 
-def build_search_view(s: Session, q: str) -> Tuple[Optional[str], str, str]:
-    """→ (vid | None, текст при пустом результате, подсказка-исправление)."""
+def build_search_view(s: Session, q: str, uid: Optional[int] = None) -> Tuple[Optional[str], str, str]:
+    """→ (vid | None, текст-подсказка вместо поиска, подсказка-исправление).
+    Запрос без букв и цифр («!!!», «?», эмодзи) не ищется и не попадает в лог."""
+    if not Catalog.has_words(q):
+        return None, NO_WORDS_TEXT, ""
     res, relaxed = CAT.smart_search(q, s.filters)
     STORE.log_query("search", q, len(res))
     if not res:
         return None, "", CAT.suggest(q)
     note = "ℹ️ Точных совпадений нет — показаны близкие по смыслу." if relaxed else ""
-    return VIEWS.new(f"🔍 «{clip(q, 80)}»", [e["id"] for e in res], note), "", ""
+    return VIEWS.new(f"🔍 «{clip(q, 80)}»", [e["id"] for e in res], note, owner=uid), "", ""
 
 
 def empty_search_reply(q: str, hint: str) -> Tuple[str, dict]:
@@ -1198,12 +1353,12 @@ def do_search(api: MaxAPI, target: dict, s: Session, uid: int, q: str) -> None:
         api.send(**target, text="Напишите запрос текстом: название, предмет или вуз.",
                  keyboard=menu_kb())
         return
-    vid, _, hint = build_search_view(s, q)
+    vid, msg, hint = build_search_view(s, q, uid)
     if vid is None:
-        t, k = empty_search_reply(q, hint)
+        t, k = (msg, menu_kb()) if msg else empty_search_reply(q, hint)
         api.send(**target, text=t, keyboard=k)
         return
-    t, k = render_list(vid, 0)
+    t, k = render_list(vid, 0, uid)
     api.send(**target, text=t, keyboard=k)
 
 
@@ -1212,6 +1367,9 @@ def do_org(api: MaxAPI, target: dict, s: Session, uid: int, q: str) -> None:
     if not q:
         api.send(**target, text="Напишите название вуза или организатора.", keyboard=menu_kb())
         return
+    if not Catalog.has_words(q):
+        api.send(**target, text=NO_WORDS_TEXT, keyboard=menu_kb())
+        return
     res = CAT.search(org=q, filters=s.filters)
     STORE.log_query("org", q, len(res))
     if not res:
@@ -1219,8 +1377,8 @@ def do_org(api: MaxAPI, target: dict, s: Session, uid: int, q: str) -> None:
                  text=f"🏛 «{clip(q, 80)}»\n\nОрганизатор не найден. Попробуйте «ИТМО», «МФТИ», «ВШЭ»…",
                  keyboard=kb([[("🏠 Меню", "m:menu")]]))
         return
-    vid = VIEWS.new(f"🏛 «{clip(q, 80)}»", [e["id"] for e in res])
-    t, k = render_list(vid, 0)
+    vid = VIEWS.new(f"🏛 «{clip(q, 80)}»", [e["id"] for e in res], owner=uid)
+    t, k = render_list(vid, 0, uid)
     api.send(**target, text=t, keyboard=k)
 
 
@@ -1272,7 +1430,7 @@ def handle_start(api: MaxAPI, upd: dict) -> None:
     if not uid:
         return
     STORE.touch(uid)
-    sess(uid).await_ = None
+    sess(uid).expect(None)
     target = {"chat_id": upd["chat_id"]} if upd.get("chat_id") else {"user_id": uid}
     api.send(**target, text=main_text(), keyboard=menu_kb())
 
@@ -1287,12 +1445,14 @@ def handle_message(api: MaxAPI, upd: dict) -> None:
         return
     STORE.touch(uid)
     s = sess(uid)
-    in_group = (msg.get("recipient") or {}).get("chat_type") == "chat"
+    rec = msg.get("recipient") or {}
+    in_group = rec.get("chat_type") == "chat"
+    chat = rec.get("chat_id")
 
     if text.startswith("/"):
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.lower().split("@")[0], arg.strip()
-        s.await_ = None
+        s.expect(None)
         if cmd in ("/start", "/menu"):
             api.send(**target, text=main_text(), keyboard=menu_kb())
         elif cmd == "/help":
@@ -1301,13 +1461,13 @@ def handle_message(api: MaxAPI, upd: dict) -> None:
             if arg:
                 do_search(api, target, s, uid, arg)
             else:
-                s.await_ = "search"
+                s.expect("search", chat)
                 api.send(**target, text="🔍 Введите поисковый запрос (название, предмет, ВУЗ…):")
         elif cmd == "/org":
             if arg:
                 do_org(api, target, s, uid, arg)
             else:
-                s.await_ = "org"
+                s.expect("org", chat)
                 api.send(**target, text="🏛 Введите название ВУЗа или организатора:")
         elif cmd == "/filters":
             t, k = render_filters_menu(s)
@@ -1316,8 +1476,7 @@ def handle_message(api: MaxAPI, upd: dict) -> None:
             api.send(**target, text=f"Ваш user_id: {uid}\n\nЧтобы открыть статистику, добавьте его в .env: "
                                     f"ADMIN_IDS={uid} — и перезапустите бота.")
         elif cmd == "/stats" and uid in ADMIN_IDS:
-            days = to_int(arg) if arg.isdigit() and 0 < int(arg) <= 365 else 30
-            api.send(**target, text=stats_text(days))
+            send_stats(api, target, uid, arg, in_group)
         elif cmd in ("/fav", "/favorites"):
             t, k = render_favorites(uid, 0)
             api.send(**target, text=t, keyboard=k)
@@ -1325,7 +1484,8 @@ def handle_message(api: MaxAPI, upd: dict) -> None:
             api.send(**target, text="Неизвестная команда. /menu — главное меню.", keyboard=menu_kb())
         return
 
-    if in_group and not s.await_:
+    awaiting = s.awaiting_in(chat, in_group)     # ожидание действует только в том чате, где запрошено
+    if in_group and not awaiting:
         return                                  # в группах отвечаем только на команды
     if not text:
         if not in_group:
@@ -1333,7 +1493,8 @@ def handle_message(api: MaxAPI, upd: dict) -> None:
                      keyboard=menu_kb())
         return
 
-    awaiting, s.await_ = s.await_, None
+    if awaiting:
+        s.expect(None)
     if awaiting == "org":
         do_org(api, target, s, uid, text)
     elif awaiting and awaiting.startswith("fs:"):
@@ -1363,19 +1524,20 @@ def handle_callback(api: MaxAPI, upd: dict) -> None:
     s = sess(uid)
     p = data.split(":")
     head = p[0]
+    chat = (((cb.get("message") or {}).get("recipient")) or {}).get("chat_id")
 
     def show(t: str, k: Optional[dict] = None, note: Optional[str] = None) -> None:
         ui_update(api, cb, t, k, note)
 
     if data in ("m:menu", "m:start"):
-        s.await_ = None
+        s.expect(None)
         return show(main_text(), menu_kb())
     if data == "m:search":
-        s.await_ = "search"
+        s.expect("search", chat)
         return show("🔍 Введите поисковый запрос.\n\nНапример: информатика, дипломатия, журналистика, ИТМО…",
                     kb([[("🏠 Меню", "m:menu")]]))
     if data == "m:org":
-        s.await_ = "org"
+        s.expect("org", chat)
         return show("🏛 Введите ВУЗ или организатора.\n\nНапример: ИТМО, МФТИ, ВШЭ, СВФУ, СПбГУ…",
                     kb([[("🏠 Меню", "m:menu")]]))
     if data == "m:about":
@@ -1406,13 +1568,16 @@ def handle_callback(api: MaxAPI, upd: dict) -> None:
         res = CAT.search(interest=name, filters=s.filters)
         if not res:
             return show(f"🎯 {name}\n\nПо этому интересу с текущими фильтрами ничего нет.", NO_RESULT_KB)
-        vid = VIEWS.new(f"🎯 {name}", [e["id"] for e in res])
-        return show(*render_list(vid, 0))
+        vid = VIEWS.new(f"🎯 {name}", [e["id"] for e in res], owner=uid)
+        return show(*render_list(vid, 0, uid))
 
     # ── списки и карточки (stateless) ──
     if head == "l" and len(p) == 3:
         vid, page = p[1], to_int(p[2])
-        return show(*(render_favorites(uid, page) if vid == "f" else render_list(vid, page)))
+        if vid != "f" and VIEWS.foreign(vid, uid):
+            # чужой список (например, в группе) — не затираем сообщение автора
+            return _notify(api, cb, "Это чужой список — сделайте свой поиск")
+        return show(*(render_favorites(uid, page) if vid == "f" else render_list(vid, page, uid)))
     if head == "c" and len(p) == 4:
         return show(*render_card(uid, p[1], p[2], to_int(p[3])))
     if head == "fav" and len(p) == 4:
@@ -1434,15 +1599,15 @@ def handle_callback(api: MaxAPI, upd: dict) -> None:
         return export_favorites(api, target, uid)
     if head == "sq" and len(p) >= 2:
         q = data[3:]
-        vid, _, hint = build_search_view(s, q)
+        vid, msg, hint = build_search_view(s, q, uid)
         if vid is None:
-            return show(*empty_search_reply(q, hint))
-        return show(*render_list(vid, 0))
+            return show(msg, menu_kb()) if msg else show(*empty_search_reply(q, hint))
+        return show(*render_list(vid, 0, uid))
 
     # ── фильтры ──
     if head == "fk" and len(p) == 2 and p[1] in FILTER_KEYS:
         s.fquery = ""
-        if not CAT.options(p[1], s.filters):
+        if not CAT.options(p[1], s.filters, interest=s.interest):
             return show(f"⚙️ {FILTER_TITLES[p[1]]}\n\nНет доступных значений при текущих фильтрах.",
                         kb([[("⬅ К фильтрам", "m:filters")]]))
         return show(*render_filter_options(s, p[1], 0))
@@ -1450,7 +1615,7 @@ def handle_callback(api: MaxAPI, upd: dict) -> None:
         return show(*render_filter_options(s, p[1], to_int(p[2])))
     if head == "fv" and len(p) == 4 and p[1] in FILTER_KEYS:
         key = p[1]
-        val = next((o for o in CAT.options(key, s.filters) if vh(o) == p[2]), None)
+        val = next((o for o in CAT.options(key, s.filters, interest=s.interest) if vh(o) == p[2]), None)
         if val is not None:
             if s.filters.get(key) == val:
                 s.filters.pop(key, None)
@@ -1459,13 +1624,15 @@ def handle_callback(api: MaxAPI, upd: dict) -> None:
                 STORE.log_query("filter", f"{key}={val}", 0)
         return show(*render_filter_options(s, key, to_int(p[3])))
     if head == "fs" and len(p) == 2 and p[1] in FILTER_KEYS:
-        s.await_ = f"fs:{p[1]}"
+        s.expect(f"fs:{p[1]}", chat)
         return show(f"🔎 {FILTER_TITLES[p[1]]}\n\nВведите часть названия, чтобы сузить список вариантов.",
                     kb([[("⬅ Назад", f"fk:{p[1]}")]]))
     if head == "fq" and len(p) == 2 and p[1] in FILTER_KEYS:
         s.fquery = ""
         return show(*render_filter_options(s, p[1], 0))
     if head == "fx" and len(p) == 2:
+        if p[1] == "interest":
+            s.interest = ""
         s.filters.pop(p[1], None)
         return show(*render_filters_menu(s))
     if data == "fclear":
@@ -1476,8 +1643,9 @@ def handle_callback(api: MaxAPI, upd: dict) -> None:
         if not res:
             return show("По выбранным фильтрам ничего не найдено.\nПопробуйте убрать часть условий.",
                         NO_RESULT_KB)
-        vid = VIEWS.new("⚙️ Подборка по фильтрам", [e["id"] for e in res])
-        return show(*render_list(vid, 0))
+        title = "⚙️ Подборка по фильтрам" + (f" · 🎯 {s.interest}" if s.interest else "")
+        vid = VIEWS.new(title, [e["id"] for e in res], owner=uid)
+        return show(*render_list(vid, 0, uid))
 
     LOG.warning("неизвестный payload: %s", data)
     _notify(api, cb, "Не понимаю эту кнопку")
@@ -1495,30 +1663,108 @@ def handle_update(api: MaxAPI, upd: dict) -> None:
         LOG.debug("пропускаю update_type=%s", t)
 
 
-def update_user(upd: dict) -> Optional[int]:
-    """user_id автора обновления — по нему сериализуем обработку."""
-    return ((upd.get("message") or {}).get("sender") or {}).get("user_id") \
-        or (upd.get("callback") or {}).get("user", {}).get("user_id") \
-        or (upd.get("user") or {}).get("user_id")
+def update_user(upd: Any) -> Optional[int]:
+    """user_id автора обновления — по нему упорядочиваем обработку. Любые null/мусор → None."""
+    if not isinstance(upd, dict):
+        return None
+    for src in (((upd.get("message") or {}).get("sender")),
+                ((upd.get("callback") or {}).get("user")),
+                upd.get("user")):
+        uid = src.get("user_id") if isinstance(src, dict) else None
+        if uid:
+            return uid
+    return None
 
 
 def safe_handle(api: MaxAPI, upd: dict) -> None:
-    uid = update_user(upd)
-    lock = user_lock(uid) if uid else threading.Lock()
-    with lock:
+    try:
+        handle_update(api, upd)
+    except Exception:  # noqa: BLE001
+        LOG.exception("ошибка обработки обновления %s",
+                      upd.get("update_type") if isinstance(upd, dict) else type(upd).__name__)
         try:
-            handle_update(api, upd)
+            if upd.get("update_type") == "message_created":
+                tgt = reply_target(upd.get("message") or {})
+                if tgt:
+                    api.send(**tgt, text="⚠️ Что-то пошло не так. Попробуйте ещё раз или /menu.")
+            elif upd.get("callback"):
+                _notify(api, upd["callback"], "Ошибка, попробуйте ещё раз")
         except Exception:  # noqa: BLE001
-            LOG.exception("ошибка обработки обновления %s", upd.get("update_type"))
+            pass
+
+
+class Dispatcher:
+    """Очередь FIFO на каждого пользователя: обновления одного пользователя обрабатываются строго
+    по порядку поступления, разные пользователи — параллельно. Для пользователя с непустой очередью
+    работает ровно одна задача-«разборщик»; когда очередь пуста, запись удаляется (память ограничена
+    числом пользователей с необработанными обновлениями)."""
+
+    def __init__(self, api: Any, pool: Any, handler=None, max_pending: int = MAX_PENDING):
+        self.api, self.pool = api, pool
+        self.handler = handler or safe_handle
+        self.max_pending = max_pending
+        self.queues: Dict[Any, deque] = {}
+        self.pending = 0
+        self.cond = threading.Condition()
+        self._warned = False
+
+    def submit(self, upd: dict) -> None:
+        try:
+            uid = update_user(upd)
+        except Exception:  # noqa: BLE001
+            uid = None
+        key: Any = uid if uid else object()            # без user_id — своя одноразовая очередь
+        with self.cond:
+            q = self.queues.get(key)
+            start = q is None
+            if start:
+                q = self.queues[key] = deque()
+            q.append(upd)
+            self.pending += 1
+            if self.pending > self.max_pending and not self._warned:
+                self._warned = True
+                LOG.warning("в очередях %d необработанных обновлений (> %d) — бот не успевает",
+                            self.pending, self.max_pending)
+            elif self.pending <= self.max_pending // 2:
+                self._warned = False
+        if start:
             try:
-                if upd.get("update_type") == "message_created":
-                    tgt = reply_target(upd.get("message") or {})
-                    if tgt:
-                        api.send(**tgt, text="⚠️ Что-то пошло не так. Попробуйте ещё раз или /menu.")
-                elif upd.get("callback"):
-                    _notify(api, upd["callback"], "Ошибка, попробуйте ещё раз")
-            except Exception:  # noqa: BLE001
-                pass
+                self.pool.submit(self._drain, key)
+            except RuntimeError as ex:                  # пул уже остановлен
+                with self.cond:
+                    lost = self.queues.pop(key, deque())
+                    self.pending -= len(lost)
+                    self.cond.notify_all()
+                LOG.warning("обновление не принято (%s): потеряно %d", ex, len(lost))
+
+    def _drain(self, key: Any) -> None:
+        while True:
+            with self.cond:
+                q = self.queues.get(key)
+                if not q:                               # очередь пуста — освобождаем запись
+                    self.queues.pop(key, None)
+                    self.cond.notify_all()
+                    return
+                upd = q.popleft()
+            try:
+                self.handler(self.api, upd)
+            except BaseException:  # noqa: BLE001      # разборщик не должен умирать
+                LOG.exception("необработанная ошибка в очереди пользователя")
+            finally:
+                with self.cond:
+                    self.pending -= 1
+                    self.cond.notify_all()
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Ждёт, пока все принятые обновления обработаны (не дольше timeout)."""
+        end = time.monotonic() + timeout
+        with self.cond:
+            while self.pending or self.queues:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self.cond.wait(left)
+            return True
 
 
 # ─────────────────── регистрация команд в MAX ───────────────────
@@ -1574,6 +1820,7 @@ def run() -> None:
     LOG.info("Нажмите Ctrl+C для остановки бота.")
 
     pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="upd")
+    disp = Dispatcher(api, pool)
     marker: Optional[int] = None
     backoff = 1
     try:
@@ -1582,7 +1829,7 @@ def run() -> None:
                 data = api.get_updates(marker=marker, timeout=POLL_TIMEOUT)
                 marker = data.get("marker", marker)
                 for upd in data.get("updates") or []:
-                    pool.submit(safe_handle, api, upd)
+                    disp.submit(upd)
                 backoff = 1
             except requests.RequestException as ex:
                 LOG.warning("сеть/API: %s — повтор через %s c", ex, backoff)
@@ -1592,9 +1839,14 @@ def run() -> None:
                 LOG.exception("непредвиденная ошибка в цикле поллинга")
                 time.sleep(3)
     except KeyboardInterrupt:
-        LOG.info("Остановка бота по Ctrl+C. До связи!")
+        LOG.info("Остановка бота по Ctrl+C: дообрабатываю полученные обновления…")
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        # уже полученные обновления (marker сдвинут) не бросаем: ждём недолго
+        idle = disp.wait_idle(SHUTDOWN_WAIT)
+        if not idle:
+            LOG.warning("за %d с не всё обработано: в очередях осталось %d", SHUTDOWN_WAIT, disp.pending)
+        pool.shutdown(wait=idle, cancel_futures=not idle)
+        LOG.info("Бот остановлен. До связи!")
 
 
 if __name__ == "__main__":

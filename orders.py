@@ -17,11 +17,12 @@ RTF читается собственным читалкой (без LibreOffice
 """
 from __future__ import annotations
 
+import codecs
 import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ───────────────────────── кавычки ─────────────────────────
 
@@ -69,22 +70,31 @@ _SYMBOLS = {"emdash": "—", "endash": "–", "lquote": "‘", "rquote": "’",
             "ldblquote": "«", "rdblquote": "»", "bullet": "•", "enspace": " ", "emspace": " "}
 _TOK = re.compile(
     r"\\'([0-9a-fA-F]{2})|\\([a-zA-Z]+)(-?\d+)? ?|\\(.)|([{}])|([^\\{}]+)", re.S)
+_CPG_RE = re.compile(r"\\ansicpg(\d+)")
 
 
 _ENC = "cp1251"
+
+
+def _codepage(head) -> str:
+    """Кодировка из \\ansicpgN (по умолчанию и для неизвестных — cp1251)."""
+    if isinstance(head, bytes):
+        head = head.decode("latin-1")
+    m = _CPG_RE.search(head[:4000])
+    enc = f"cp{m.group(1)}" if m else "cp1251"
+    try:
+        codecs.lookup(enc)
+    except LookupError:
+        enc = "cp1251"
+    return enc
 
 
 def _decode_rtf(raw: bytes) -> str:
     """Текст RTF; байты без символа в кодировке сохраняются (surrogateescape) —
     это нужно, чтобы посчитать хэш встроенных картинок по исходным байтам."""
     global _ENC
-    m = re.search(rb"\\ansicpg(\d+)", raw[:2000])
-    _ENC = f"cp{m.group(1).decode()}" if m else "cp1251"
-    try:
-        return raw.decode(_ENC, "surrogateescape")
-    except LookupError:
-        _ENC = "cp1251"
-        return raw.decode(_ENC, "surrogateescape")
+    _ENC = _codepage(raw[:4000])
+    return raw.decode(_ENC, "surrogateescape")
 
 
 def _iter_tokens(s: str):
@@ -104,6 +114,180 @@ def _iter_tokens(s: str):
             yield (None, "bin", data, None, None, None)
         else:
             yield hexv, word, num, sym, brace, text
+
+
+_HEX_DIGITS = re.compile(r"[^0-9a-fA-F]")
+_STRUCT = {"par", "line", "tab", "cell", "row", "nestcell", "nestrow", "trowd"}
+
+
+def _rtf_events(s: str):
+    """
+    Разбор RTF в поток событий (общий для таблиц и реквизитов):
+      ("text", str) · ("img", sha1[:12]) · ("par", в_таблице) · ("line",) · ("tab",)
+      ("cell",) · ("row",) · ("nestcell",) · ("nestrow",) · ("trowd", в_таблице) · ("end", в_таблице)
+
+    Unicode: \\ucN действует в пределах группы (по умолчанию 1); после \\uN
+    пропускаются N символов замены — обычный текст, \\'xx (один символ) или
+    управляющий символ; управляющее слово или скобка группы пропуск прекращает.
+    Отрицательные \\uN → +65536; пара суррогатов UTF-16 склеивается в один символ,
+    одиночный суррогат → U+FFFD. Байты \\'xx декодируются кодировкой \\ansicpgN
+    (последовательность байтов — целиком, поэтому работают и двухбайтовые кодировки).
+
+    Картинки: \\pict с \\binN — хэш двоичных данных; \\pict с шестнадцатеричными
+    данными — хэш декодированных байтов. Картинки внутри пропускаемых групп
+    (\\nonshppict и т. п.) не учитываются; {\\*\\shppict …} — учитывается.
+    """
+    enc = _codepage(s)
+    stack: List[tuple] = []
+    skip = False
+    uc = 1
+    intbl = False
+    first = star = False
+    uc_pending = 0
+    hexbuf = bytearray()
+    hi_sur: Optional[int] = None
+    pict_depth: Optional[int] = None
+    pict_ok = pict_bin = False
+    pict_hex: List[str] = []
+
+    def flush():
+        nonlocal hexbuf
+        out = []
+        if hexbuf:
+            out.append(bytes(hexbuf).decode(enc, "replace"))
+            hexbuf = bytearray()
+        return out
+
+    def text_out(t: str):
+        """Текст с учётом недописанного суррогата."""
+        nonlocal hi_sur
+        res = flush()
+        if hi_sur is not None:
+            res.append("\ufffd")
+            hi_sur = None
+        if t:
+            res.append(t)
+        return [("text", x) for x in res if x]
+
+    for hexv, word, num, sym, brace, text in _iter_tokens(s):
+        if hexv is not None:
+            if skip:
+                continue
+            if uc_pending:
+                uc_pending -= 1
+                continue
+            if hi_sur is not None:
+                yield from text_out("")
+            hexbuf.append(int(hexv, 16))
+            continue
+        # всё, что не \'xx, завершает последовательность байтов
+        if hexbuf:
+            for x in flush():
+                yield ("text", x)
+        if brace == "{":
+            stack.append((skip, uc, intbl))
+            first, star = True, False
+            uc_pending = 0
+            continue
+        if brace == "}":
+            uc_pending = 0
+            if pict_depth is not None and len(stack) == pict_depth:
+                if pict_ok and not pict_bin:
+                    data = _HEX_DIGITS.sub("", "".join(pict_hex))
+                    if data:
+                        data = data[: len(data) // 2 * 2]
+                        yield ("img", hashlib.sha1(bytes.fromhex(data)).hexdigest()[:12])
+                pict_depth = None
+                pict_hex = []
+            skip, uc, intbl = stack.pop() if stack else (False, 1, False)
+            first = star = False
+            continue
+        if sym is not None:
+            if sym == "*" and first:
+                skip, star = True, True
+                continue
+            first = False
+            if skip:
+                continue
+            if uc_pending:
+                uc_pending -= 1
+                continue
+            if sym in "{}\\":
+                yield from text_out(sym)
+            elif sym == "~":
+                yield from text_out(" ")
+            elif sym == "_":
+                yield from text_out("-")
+            continue
+        if word is not None:
+            if first:
+                if star and word == "shppict":
+                    skip = stack[-1][0] if stack else False      # современная картинка Word
+                elif word in _SKIP_DEST:
+                    skip = True
+                    if word == "pict":
+                        pict_depth = len(stack)
+                        pict_ok = not (stack[-1][0] if stack else False)   # родитель не пропускается
+                        pict_bin, pict_hex = False, []
+            first = star = False
+            if word == "bin":
+                if pict_depth is not None and len(stack) == pict_depth:
+                    if pict_ok:
+                        digest = hashlib.sha1(num.encode(enc, "surrogateescape")).hexdigest()[:12]
+                        yield ("img", digest)
+                    pict_bin = True
+                continue
+            if skip:
+                continue
+            if word == "u" and num is not None:
+                code = int(num)
+                if code < 0:
+                    code += 65536
+                if 0xD800 <= code <= 0xDBFF:
+                    if hi_sur is not None:
+                        yield from text_out("")
+                    hi_sur = code
+                elif 0xDC00 <= code <= 0xDFFF:
+                    if hi_sur is not None:
+                        ch = chr(0x10000 + ((hi_sur - 0xD800) << 10) + (code - 0xDC00))
+                        hi_sur = None
+                        yield ("text", ch)
+                    else:
+                        yield from text_out("\ufffd")
+                else:
+                    yield from text_out(chr(code))
+                uc_pending = uc
+                continue
+            uc_pending = 0
+            if word == "uc":
+                uc = int(num) if num is not None else 1
+            elif word == "pard":
+                intbl = False
+            elif word == "intbl":
+                intbl = True
+            elif word == "itap":
+                intbl = int(num or 1) > 0
+            elif word in _STRUCT:
+                if hi_sur is not None:
+                    yield from text_out("")
+                yield (word, intbl) if word in ("par", "trowd") else (word,)
+            elif word in _SYMBOLS:
+                yield from text_out(_SYMBOLS[word])
+            continue
+        # обычный текст
+        first = star = False
+        if pict_depth is not None and len(stack) == pict_depth and not pict_bin:
+            pict_hex.append(text)
+        if skip:
+            continue
+        t = text.replace("\r", "").replace("\n", "")
+        if uc_pending and t:
+            k = min(uc_pending, len(t))
+            t, uc_pending = t[k:], uc_pending - k
+        if t:
+            yield from text_out(t)
+    yield from text_out("")
+    yield ("end", intbl)
 
 
 # ───────────────────────── картинки вместо текста ─────────────────────────
@@ -138,127 +322,83 @@ def resolve_images(s: str) -> str:
     return re.sub(r"\s*\x08", "", out)       # \b в тексте картинки: «приклеить к предыдущему»
 
 
-def rtf_tables(s: str) -> List[List[str]]:
-    """Все строки всех таблиц RTF как списки текстов ячеек (абзацы ячейки — через \\n)."""
+def rtf_rows_raw(s: str) -> List[List[str]]:
+    """
+    Строки таблиц RTF как списки сырых текстов ячеек (картинки — ⟦img:sha⟧).
+      • абзацы ячейки — через \\n; ячейки вложенной таблицы (\\nestcell) — тоже через \\n;
+      • буфер ячейки сбрасывается на \\row, в конце абзаца вне таблицы (\\pard без
+        \\intbl) и на \\trowd вне таблицы, поэтому текст между таблицами не прилипает
+        к первой ячейке;
+      • незавершённая строка (нет \\row) сохраняется, если в ней есть текст.
+    """
     rows: List[List[str]] = []
     cells: List[str] = []
     buf: List[str] = []
-    stack: List[bool] = []
-    skip = False
-    first = False
     started = False
-    uc_skip = 0
-    pict_ok = False
-    for hexv, word, num, sym, brace, text in _iter_tokens(s):
-        if brace == "{":
-            stack.append(skip)
-            first = True
-            continue
-        if brace == "}":
-            skip = stack.pop() if stack else False
-            first = False
-            continue
-        if sym is not None:
-            if sym == "*" and first:
-                skip = True
-            elif not skip and started:
-                if sym in "{}\\":
-                    buf.append(sym)
-                elif sym == "~":
-                    buf.append(" ")
-            first = False
-            continue
-        if word is not None:
-            if first and word in _SKIP_DEST:
-                skip = True
-                if word == "pict":
-                    pict_ok = started and not (stack[-1] if stack else False)
-            first = False
-            if word == "bin":
-                if pict_ok:
-                    digest = hashlib.sha1(num.encode(_ENC, "surrogateescape")).hexdigest()[:12]
-                    buf.append(f"⟦img:{digest}⟧")
-                pict_ok = False
-                continue
-            if word == "trowd":
-                started = True
-            if skip or not started:
-                continue
-            if word == "cell":
-                cells.append("".join(buf))
+
+    def close_row():
+        nonlocal cells
+        if cells and any(c.strip() for c in cells):
+            rows.append(cells)
+        cells = []
+
+    for ev in _rtf_events(s):
+        kind = ev[0]
+        if kind == "text":
+            if started:
+                buf.append(ev[1])
+        elif kind == "img":
+            if started:
+                buf.append(f"⟦img:{ev[1]}⟧")
+        elif kind == "trowd":
+            started = True
+            if not ev[1] and not cells:    # текст вне таблицы перед новой строкой таблицы
                 buf = []
-            elif word == "row":
-                rows.append(cells)
-                cells = []
-            elif word in ("par", "line"):
+        elif kind == "par":
+            if ev[1]:
                 buf.append("\n")
-            elif word == "tab":
-                buf.append(" ")
-            elif word == "u" and num is not None:
-                buf.append(chr(int(num) % 65536))
-                uc_skip = 1
-            elif word in _SYMBOLS:
-                buf.append(_SYMBOLS[word])
-            continue
-        first = False
-        if skip or not started:
-            continue
-        if hexv is not None:
-            buf.append(bytes([int(hexv, 16)]).decode("cp1251", "replace"))
-        elif text is not None:
-            if uc_skip:
-                text, uc_skip = text[uc_skip:], 0
-            buf.append(text.replace("\r", "").replace("\n", ""))
-    return [[clean_cell(resolve_images(c)) for c in r] for r in rows]
+            else:                      # абзац вне таблицы закончился
+                close_row()
+                buf = []
+        elif kind in ("line", "nestcell", "nestrow"):
+            buf.append("\n")
+        elif kind == "tab":
+            buf.append(" ")
+        elif kind == "cell":
+            started = True
+            cells.append("".join(buf))
+            buf = []
+        elif kind == "row":
+            rows.append(cells)
+            cells, buf = [], []
+        elif kind == "end":
+            tail = "".join(buf)
+            if ev[1] and tail.strip():
+                cells.append(tail)
+            close_row()
+    return rows
+
+
+def rtf_tables(s: str) -> List[List[str]]:
+    """Все строки всех таблиц RTF как списки текстов ячеек (абзацы ячейки — через \\n)."""
+    return [[clean_cell(resolve_images(c)) for c in r] for r in rtf_rows_raw(s)]
 
 
 def rtf_plain(s: str, limit: int = 60000) -> str:
     """Весь видимый текст RTF (вне зависимости от таблиц) — для реквизитов приказа."""
     out: List[str] = []
-    stack: List[bool] = []
-    skip = first = False
-    uc_skip = size = 0
-    for hexv, word, num, sym, brace, text in _iter_tokens(s):
-        if brace == "{":
-            stack.append(skip)
-            first = True
-            continue
-        if brace == "}":
-            skip = stack.pop() if stack else False
-            first = False
-            continue
-        if sym is not None:
-            if sym == "*" and first:
-                skip = True
-            elif not skip and sym == "~":
-                out.append(" ")
-            first = False
-            continue
-        if word is not None:
-            if first and word in _SKIP_DEST:
-                skip = True
-            first = False
-            if skip:
-                continue
-            if word in ("par", "line", "row"):
-                out.append("\n")
-            elif word in ("cell", "tab"):
-                out.append(" ")
-            elif word == "u" and num is not None:
-                out.append(chr(int(num) % 65536))
-                uc_skip = 1
-            continue
-        first = False
-        if skip:
-            continue
-        piece = (bytes([int(hexv, 16)]).decode("cp1251", "replace") if hexv is not None
-                 else text.replace("\r", "").replace("\n", ""))
-        if uc_skip and hexv is None:
-            piece, uc_skip = piece[uc_skip:], 0
-        out.append(piece)
-        size += len(piece)
-        if size > limit:
-            break
+    size = 0
+    for ev in _rtf_events(s):
+        kind = ev[0]
+        if kind == "text":
+            out.append(ev[1])
+            size += len(ev[1])
+            if size > limit:
+                break
+        elif kind in ("par", "line", "row", "nestrow"):
+            out.append("\n")
+        elif kind in ("cell", "tab", "nestcell"):
+            out.append(" ")
     return "".join(out)
 
 
@@ -327,6 +467,13 @@ class Order:
     path: str
     meta: Dict[str, str] = field(default_factory=dict)
     rows: List[List[str]] = field(default_factory=list)
+    # картинки без текста в image_text.json: (номер строки в rows с 1, № в приказе, sha1[:12])
+    unresolved_images: List[Tuple[int, str, str]] = field(default_factory=list)
+
+
+def _keep_row(r: List[str]) -> bool:
+    """Строки таблицы с данными (≥ 6 ячеек) и заголовки разделов (слитая ячейка)."""
+    return len(r) >= 6 or (bool(r) and is_section_row(r) is not None)
 
 
 def read_order(path) -> Order:
@@ -334,17 +481,34 @@ def read_order(path) -> Order:
     if not p.exists():
         raise FileNotFoundError(path)
     suffix = p.suffix.lower()
+    unresolved: List[Tuple[int, str, str]] = []
     if suffix == ".rtf":
         s = _decode_rtf(p.read_bytes())
-        rows = rtf_tables(s)
+        rows = []
+        for raw in rtf_rows_raw(s):
+            r = [clean_cell(resolve_images(c)) for c in raw]
+            if not _keep_row(r):
+                continue
+            rows.append(r)
+            if len(r) >= 6:
+                for sha in uniq(m for c in raw for m in IMG_RE.findall(c)):
+                    if sha not in IMAGE_TEXT:
+                        unresolved.append((len(rows), r[0], sha))
         meta_text = rtf_plain(s)
     elif suffix == ".docx":
         rows, head = docx_tables(p)
+        rows = [r for r in rows if _keep_row(r)]
         meta_text = head
     else:
         raise ValueError(f"Неподдерживаемый формат: {p.suffix} (нужен .rtf или .docx)")
-    rows = [r for r in rows if len(r) >= 6]
-    return Order(path=str(p), meta=parse_meta(meta_text), rows=rows)
+    return Order(path=str(p), meta=parse_meta(meta_text), rows=rows, unresolved_images=unresolved)
+
+
+def image_warnings(order: Order) -> List[str]:
+    """Предупреждения о картинках в строках таблицы, текста которых нет в image_text.json."""
+    return [f"картинка без расшифровки в строке {n}{f' (№ {num})' if num else ''} "
+            f"(sha1 {sha}) — добавьте в image_text.json"
+            for n, num, sha in order.unresolved_images]
 
 
 def find_order(ministry: str, folder: str = ".") -> Optional[str]:
@@ -364,7 +528,13 @@ def find_order(ministry: str, folder: str = ".") -> Optional[str]:
 
 # ───────────────────────── общие приёмы разбора строк ─────────────────────────
 
+def pad_row(r: List[str], n: int = 6) -> List[str]:
+    """Строка, дополненная пустыми ячейками до n (заголовки разделов в RTF — одна ячейка)."""
+    return list(r) + [""] * (n - len(r)) if len(r) < n else list(r)
+
+
 def is_header_row(r: List[str]) -> bool:
+    r = pad_row(r)
     n, name = r[0], r[1]
     if ("п/п" in n) or n.lower().startswith(("n п", "№")):
         return True
@@ -381,9 +551,15 @@ SECTION_RE = re.compile(r"^(\d+)\.\s+Мероприятия\b")
 
 
 def is_section_row(r: List[str]) -> Optional[int]:
-    """Номер раздела, если это строка-заголовок раздела (в RTF — слитая ячейка)."""
+    """
+    Номер раздела, если это строка-заголовок раздела: в RTF — строка из одной слитой
+    ячейки, в docx — текст повторён во всех ячейках.
+    """
+    if not r:
+        return None
     m = SECTION_RE.match(r[0])
-    if m and (not r[1] or r[1] == r[0]):
+    second = r[1] if len(r) > 1 else ""
+    if m and (not second or second == r[0]) and not any(c and c != r[0] for c in r[2:]):
         return int(m.group(1))
     return None
 

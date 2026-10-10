@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import Dict, List
 
 from common import norm_name, org_list
-from orders import (find_order, is_header_row, norm_level, read_order, uniq)
+from orders import (find_order, image_warnings, is_header_row, is_section_row, norm_level,
+                    pad_row, read_order, uniq)
 
 DEFAULT_OUT = "minobr_official.json"
 MINISTRY = "Минобрнауки России"
@@ -82,7 +83,8 @@ def parse_rows(rows: List[List[str]]) -> List[dict]:
     cur_key = ""
     first_orgs: set = set()
     for r in rows:
-        if is_header_row(r) or not any(r[:6]):
+        r = pad_row(r)
+        if is_header_row(r) or is_section_row(r) is not None or not any(r[:6]):
             continue
         num, name, org, profile, field, level = r[:6]
         key = norm_name(name)
@@ -129,6 +131,8 @@ def parse_rows(rows: List[List[str]]) -> List[dict]:
 
 def check(events: List[dict]) -> List[str]:
     """Предупреждения о подозрительных данных."""
+    if not events:
+        return ["нет ни одной олимпиады — проверьте файл"]
     w = []
     nums = [e["official_number"] for e in events]
     if len(set(nums)) != len(nums):
@@ -155,7 +159,7 @@ def parse(path: str) -> dict:
     if order.meta.get("ministry") not in (None, MINISTRY):
         sys.exit(f"{path}: это приказ {order.meta.get('ministry')}, а не {MINISTRY}")
     events = parse_rows(order.rows)
-    return {"meta": order.meta, "warnings": check(events), "events": events}
+    return {"meta": order.meta, "warnings": check(events) + image_warnings(order), "events": events}
 
 
 def main():
@@ -171,7 +175,7 @@ def main():
     m = data["meta"]
     print(f"{Path(path).name}: приказ {m.get('ministry', '?')} от {m.get('date', '?')} № {m.get('number', '?')}")
     print(f"Олимпиад: {len(ev)}; строк «профиль–УГСН–уровень»: {sum(len(e['entries']) for e in ev)}")
-    for w in check(ev):
+    for w in data["warnings"]:
         print("⚠", w)
     Path(a.out).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Сохранено → {a.out}")

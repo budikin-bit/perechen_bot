@@ -28,7 +28,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from common import acronyms, legacy_key, make_id, norm_name, org_list, short_org
+from common import (STOP_STEMS, acronyms, fold_name, id_hash, legacy_key, make_id,
+                    norm_name, org_list, short_org, stem)
 from orders import format_source
 
 HERE = Path(__file__).resolve().parent
@@ -241,16 +242,39 @@ def load_parsed(path: Path):
     return data
 
 
+def _num_key(num: str):
+    """«6.95» → (6, 95); нечисловые части — после числовых."""
+    return tuple((0, int(x), "") if x.isdigit() else (1, 0, x) for x in re.split(r"[.\s]+", num or ""))
+
+
+def assign_ids(prefix: str, raw: List[dict], seen: Dict[str, int]) -> List[str]:
+    """
+    id для записей парсера в порядке raw. Дубли названий внутри источника не зависят
+    от порядка строк: базовый id получает запись с наименьшим (номер, организатор),
+    остальные — суффикс от (название, организатор + номер) — см. common.make_id.
+    """
+    order = sorted(range(len(raw)), key=lambda i: (
+        norm_name(raw[i]["name"]), _num_key(raw[i].get("official_number", "")),
+        norm_name(raw[i].get("organizer_raw", ""))))
+    ids = [""] * len(raw)
+    for i in order:
+        r = raw[i]
+        ids[i] = make_id(prefix, r["name"], seen,
+                         secondary=f'{r.get("organizer_raw", "")} {r.get("official_number", "")}')
+    return ids
+
+
 def convert_minobr(raw, rules, seen):
     out = []
-    for r in raw:
+    ids = assign_ids("mo", raw, seen)
+    for r, eid in zip(raw, ids):
         directions = ["Наука и образование"]
         prof = r.get("profiles", [])
         fields = r.get("study_fields", [])
         school = [f for f in fields if f.lower() in SCHOOL_TOKENS]
         subs, ints = classify(r["name"], prof, school, directions)
         out.append({
-            "id": make_id("mo", r["name"], seen),
+            "id": eid,
             "legacy_key": legacy_key(r["name"]),
             "source_code": "minobr",
             "official_number": r["official_number"],
@@ -272,7 +296,8 @@ def convert_minobr(raw, rules, seen):
 
 def convert_minpros(raw, rules, seen):
     out = []
-    for r in raw:
+    ids = assign_ids("mp", raw, seen)
+    for r, eid in zip(raw, ids):
         directions = r.get("directions") or ([r["direction"]] if r.get("direction") else [])
         prof = r.get("profiles", [])
         entries = r.get("entries") or [
@@ -281,7 +306,7 @@ def convert_minpros(raw, rules, seen):
         ]
         subs, ints = classify(r["name"], prof, [], directions)
         ev = {
-            "id": make_id("mp", r["name"], seen),
+            "id": eid,
             "legacy_key": legacy_key(r["name"]),
             "source_code": "minpros",
             "official_number": r["official_number"],
@@ -311,7 +336,7 @@ def source_info(meta: dict, ministry: str, variant: str, projects_text: str) -> 
 
 # ───────────────────────── связи и правки ─────────────────────────
 
-def mark_in_both(events, manual_pairs) -> int:
+def mark_in_both(events, manual_pairs, unused: Optional[List[str]] = None) -> int:
     """Точное совпадение нормализованного названия + пары, подтверждённые вручную."""
     mo = {}
     for e in events:
@@ -328,9 +353,14 @@ def mark_in_both(events, manual_pairs) -> int:
             pairs.add((a["id"], b["id"]))
     for n_obr, n_pros in manual_pairs:
         a = mo.get(norm_name(n_obr))
-        for b in mp_by_name.get(norm_name(n_pros), []):
-            if a:
-                pairs.add((a["id"], b["id"]))
+        bs = mp_by_name.get(norm_name(n_pros), [])
+        if not a or not bs:
+            if unused is not None:
+                miss = [x for x, ok in (("Минобр", a), ("Минпрос", bs)) if not ok]
+                unused.append(f"same_event: [«{n_obr}», «{n_pros}»] — не найдено ({', '.join(miss)})")
+            continue
+        for b in bs:
+            pairs.add((a["id"], b["id"]))
     by_id = {e["id"]: e for e in events}
     for a, b in pairs:
         by_id[a]["in_both"] = 1
@@ -357,77 +387,275 @@ def fuzzy_candidates(events, threshold=0.85, limit=80):
     return sorted(res, reverse=True)[:limit]
 
 
-def apply_overrides(events, ov) -> int:
-    by_name = ov.get("by_name", {})
+def load_overrides(path: Optional[Path] = None) -> dict:
+    """overrides.json; ключи by_name и названия в same_event приводятся к norm_name."""
+    path = path or OVERRIDES
+    if not path.exists():
+        return {"by_name": {}, "same_event": []}
+    ov = json.loads(path.read_text(encoding="utf-8"))
+    by_name = {}
+    for k, v in (ov.get("by_name") or {}).items():
+        if k.startswith("_"):
+            continue
+        by_name[norm_name(k)] = v
+    ov["by_name"] = by_name
+    ov["same_event"] = [[norm_name(a), norm_name(b)] for a, b in ov.get("same_event") or []]
+    return ov
+
+
+def apply_overrides(events, ov, unused: Optional[List[str]] = None) -> int:
+    """Ручные правки по названию. Ключи, не совпавшие ни с одним мероприятием, — в unused."""
+    by_name = {norm_name(k): v for k, v in (ov.get("by_name") or {}).items()}
     n = 0
+    hit = set()
     for e in events:
-        o = by_name.get(norm_name(e["name"]))
+        key = norm_name(e["name"])
+        o = by_name.get(key)
         if not o:
             continue
         n += 1
+        hit.add(key)
         for k in ("subjects", "interests", "type", "levels"):
             if k in o:
                 e[k] = o[k]
         for a in o.get("add_aliases", []):
             if a not in e["organizer_aliases"]:
                 e["organizer_aliases"].append(a)
+    if unused is not None:
+        unused.extend(f"by_name: «{k}» — нет мероприятия с таким названием"
+                      for k in by_name if k not in hit)
     return n
 
 
 # ───────────────────────── проверка и отчёт ─────────────────────────
 
-def validate(events):
+def validate(events) -> List[str]:
+    """Дубли id и пустые обязательные поля — ошибка; мероприятия без entries — предупреждение."""
     ids = Counter(e["id"] for e in events)
     dup = [k for k, v in ids.items() if v > 1]
     if dup:
         sys.exit(f"Дубли id: {dup[:5]}")
+    warn = []
     for e in events:
-        for k in ("id", "name", "source_code", "entries"):
-            if not e.get(k) and k != "entries":
+        for k in ("id", "name", "source_code"):
+            if not e.get(k):
                 sys.exit(f"Пустое поле {k}: {e}")
+        if not e.get("entries"):
+            warn.append(f"{e.get('official_number') or '?'}: нет строк профиль/уровень — {e['name'][:60]!r}")
+    return warn
+
+
+# Слова-«предметы» для сопоставления версий: если названия отличаются только ими
+# («… по физике» / «… по химии», «Ломоносов по математике» / «… по механике»),
+# это соседние мероприятия, а не переименование.
+_MATCH_SUBJECT_EXTRA = re.compile(
+    W + r"(?:механик|лингвист|филолог|журналист|психолог|педагог|естествен|"
+    r"гуманитар|граф|рисун|живопис|композиц|скульпт|дизайн|вокал|хор|музык|"
+    r"робот|программир|электр|энергет|строит|агро|медиц|фармац|стомат|"
+    r"ветерин|почв|лес|сельскохоз|архитект|литер|словес|язык|грамот)")
+_TOKEN_RE = re.compile(r"[0-9a-zа-яі]+")
+
+
+def _match_tokens(folded: str) -> set:
+    return {stem(t) for t in _TOKEN_RE.findall(folded)} - STOP_STEMS
+
+
+def _subject_of(token: str) -> Optional[str]:
+    for sub, rx in SUBJECT_RX:
+        if rx.search(token):
+            return sub
+    return token if _MATCH_SUBJECT_EXTRA.search(token) else None
+
+
+def is_sibling(a_tokens: set, b_tokens: set) -> bool:
+    """
+    Названия отличаются предметом → разные мероприятия одного цикла:
+      • все отличающиеся слова (с обеих сторон) — предметы;
+      • или с обеих сторон среди отличий есть предметы, и это разные предметы.
+    """
+    da, db = a_tokens - b_tokens, b_tokens - a_tokens
+    sa = {_subject_of(t) for t in da} - {None}
+    sb = {_subject_of(t) for t in db} - {None}
+    if not (sa or sb):
+        return False
+    only_subj_a = all(_subject_of(t) for t in da)
+    only_subj_b = all(_subject_of(t) for t in db)
+    if only_subj_a and only_subj_b:
+        return True
+    return bool(sa and sb and sa != sb)
+
+
+def _trigrams(folded: str) -> set:
+    t = folded.replace(" ", "")
+    return {t[i:i + 3] for i in range(max(1, len(t) - 2))}
+
+
+def align_acronyms(fa: str, fb: str):
+    """
+    Аббревиатура с одной стороны и полное название с другой: «рк кипу» ↔ «рк крымский
+    инженерно педагогический университет». Цепочка слов, первые буквы которых дают
+    аббревиатуру (2–6 букв), заменяется самой аббревиатурой.
+    """
+    def fold_side(x: str, y: str) -> str:
+        xs, ys = x.split(), y.split()
+        for t in set(xs) - set(ys):
+            if not (2 <= len(t) <= 6 and t.isalpha()):
+                continue
+            n = len(t)
+            for i in range(len(ys) - n + 1):
+                run = ys[i:i + n]
+                if "".join(w[0] for w in run) == t and t not in run:
+                    ys = ys[:i] + [t] + ys[i + n:]
+                    break
+        return " ".join(ys)
+    return fold_side(fb, fa), fold_side(fa, fb)
+
+
+def name_score(a: str, b: str) -> float:
+    """
+    Похожесть названий 0…1 по fold_name (+ align_acronyms): среднее
+    SequenceMatcher и Жаккара (максимум из Жаккара по буквенным триграммам без
+    пробелов — «видео экскурсий» = «видеоэкскурсий» — и по основам слов —
+    «Фоксфорда» = «Фоксфорд»).
+    """
+    fa, fb = align_acronyms(fold_name(a), fold_name(b))
+    if fa == fb:
+        return 1.0
+    ga, gb = _trigrams(fa), _trigrams(fb)
+    jac = len(ga & gb) / len(ga | gb) if ga | gb else 0.0
+    ta, tb = _match_tokens(fa), _match_tokens(fb)
+    if ta | tb:
+        jac = max(jac, len(ta & tb) / len(ta | tb))
+    return (difflib.SequenceMatcher(None, fa, fb).ratio() + jac) / 2
+
+
+def org_score(a: str, b: str) -> float:
+    """Похожесть организаторов (fold_name + align_acronyms, SequenceMatcher)."""
+    fa, fb = align_acronyms(fold_name(a), fold_name(b))
+    if not fa or not fb:
+        return 0.0
+    return difflib.SequenceMatcher(None, fa, fb).ratio()
+
+
+def compare_names(a: str, b: str, fa: Optional[str] = None, fb: Optional[str] = None,
+                  org_a: str = "", org_b: str = "", threshold: float = 0.9):
+    """
+    Одно ли это мероприятие (для переноса избранного)? None — нет, иначе
+    (оценка названий, похожесть организаторов, вид: «fuzzy» | «contain»).
+      • fuzzy   — name_score ≥ threshold;
+      • contain — все основы короткого названия (≥ 4 значимых) входят в длинное,
+                  длинное добавляет не больше слов, чем есть в коротком, и
+                  организаторы совпадают (org_score ≥ 0.85): «Путь к Олимпу:
+                  Проекты будущего» → «Всероссийский … конкурс «Путь к Олимпу: …»».
+    Пары, отличающиеся предметом (is_sibling), отвергаются всегда.
+    """
+    fa = fold_name(a) if fa is None else fa
+    fb = fold_name(b) if fb is None else fb
+    if abs(len(fa) - len(fb)) > 60:
+        return None
+    xa, xb = align_acronyms(fa, fb)
+    ta, tb = _match_tokens(xa), _match_tokens(xb)
+    if xa != xb and is_sibling(ta, tb):
+        return None
+    sc = name_score(a, b)
+    if sc >= threshold:
+        return sc, org_score(org_a, org_b), "fuzzy"
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(short) >= 4 and short <= long_ and len(long_ - short) <= len(short):
+        osc = org_score(org_a, org_b)
+        if osc >= 0.85:
+            return sc, osc, "contain"
+    return None
 
 
 def attach_old_ids(events, prev_path: Optional[Path], threshold: float = 0.9):
     """
-    Переносит избранное между версиями каталога: если мероприятие переименовано
-    (id изменился), старый id записывается в old_ids нового. Возвращает
-    (сопоставлено [(старое название, новое название, коэффициент)], пропавшие названия).
+    Переносит избранное между версиями каталога: старые id, которых нет в новом
+    каталоге, записываются в old_ids нового мероприятия (bot.py по ним переносит
+    избранное пользователей).
+
+    1. Точное совпадение: одинаковая хэш-часть id (то же norm_name) в любом
+       источнике — мероприятие переехало между перечнями («mo-…» → «mp-…») или
+       было дублем названия («mp-…-2»). Несколько старых id могут указывать на
+       одно новое мероприятие.
+    2. Нечёткое: среди оставшихся старых и новых (которых не было в прошлом
+       каталоге) — name_score ≥ threshold по fold_name (латиница/римские цифры,
+       формы собственности, «ВСО» …), без пар, отличающихся предметом
+       (is_sibling). Пары выбираются глобально: все кандидаты по убыванию
+       (оценка, похожесть организатора, тот же источник), жадно один к одному.
+    old_ids прошлого каталога переносятся дальше (цепочки переименований).
+
+    Возвращает (сопоставлено [(старое название, новое название, оценка, старый id,
+    новый id, вид)], пропавшие названия). Вид: «id» — тот же хэш, «fuzzy» — нечёткое.
     """
     if not prev_path or not prev_path.exists():
         return [], []
     prev = json.loads(prev_path.read_text(encoding="utf-8")).get("events", [])
-    new_ids = {e["id"] for e in events}
+    by_id = {e["id"]: e for e in events}
     prev_ids = {e["id"] for e in prev}
-    fresh = [e for e in events if e["id"] not in prev_ids]
-    fresh_by_src: Dict[str, List[tuple]] = {}
-    for e in fresh:
-        fresh_by_src.setdefault(e["source_code"], []).append((norm_name(e["name"]), e))
-    matched, dropped = [], []
-    taken = set()
+
+    def add_old(e, old_id):
+        if old_id and old_id != e["id"] and old_id not in by_id:
+            lst = e.setdefault("old_ids", [])
+            if old_id not in lst:
+                lst.append(old_id)
+
+    # старые id, уже сохранённые в прошлом каталоге, для живущих дальше мероприятий
     for pe in prev:
-        if pe["id"] in new_ids:
+        if pe["id"] in by_id:
+            for o in pe.get("old_ids") or []:
+                add_old(by_id[pe["id"]], o)
+
+    gone = [pe for pe in prev if pe["id"] not in by_id]
+    by_hash: Dict[str, List[dict]] = {}
+    for e in events:
+        by_hash.setdefault(id_hash(e["id"]), []).append(e)
+
+    matched, rest = [], []
+    exact_targets = set()
+    for pe in gone:
+        cands = by_hash.get(id_hash(pe["id"]), [])
+        if not cands:
+            rest.append(pe)
             continue
-        k = norm_name(pe["name"])
-        best, br = None, 0.0
-        for n, e in fresh_by_src.get(pe["source_code"], []):
-            if e["id"] in taken or abs(len(n) - len(k)) > 30:
+        # тот же источник и id без суффикса — предпочтительнее
+        tgt = min(cands, key=lambda e: (e["source_code"] != pe["source_code"],
+                                        e["id"].count("-"), e["id"]))
+        add_old(tgt, pe["id"])
+        for o in pe.get("old_ids") or []:
+            add_old(tgt, o)
+        exact_targets.add(tgt["id"])
+        matched.append((pe["name"], tgt["name"], 1.0, pe["id"], tgt["id"], "id"))
+
+    fresh = [e for e in events if e["id"] not in prev_ids and e["id"] not in exact_targets]
+    pairs = []
+    for pe in rest:
+        fp = fold_name(pe["name"])
+        for e in fresh:
+            kind = compare_names(pe["name"], e["name"], fp, None,
+                                 pe.get("organizer_raw", ""), e.get("organizer_raw", ""),
+                                 threshold)
+            if kind is None:
                 continue
-            sm = difflib.SequenceMatcher(None, k, n)
-            if sm.real_quick_ratio() < br or sm.quick_ratio() < br:
-                continue
-            r = sm.ratio()
-            if r > br:
-                best, br = e, r
-        if best is not None and br >= threshold:
-            best.setdefault("old_ids", []).append(pe["id"])
-            taken.add(best["id"])
-            matched.append((pe["name"], best["name"], br))
-        else:
-            dropped.append(pe["name"])
+            sc, osc, how = kind
+            pairs.append((sc, osc, pe["source_code"] == e["source_code"], pe["id"], e["id"],
+                          pe, e, how))
+    pairs.sort(key=lambda x: (-x[0], -x[1], not x[2], x[3], x[4]))
+    used_old, used_new = set(), set()
+    for sc, osc, _same, oid, nid, pe, e, how in pairs:
+        if oid in used_old or nid in used_new:
+            continue
+        used_old.add(oid)
+        used_new.add(nid)
+        add_old(e, oid)
+        for o in pe.get("old_ids") or []:
+            add_old(e, o)
+        matched.append((pe["name"], e["name"], sc, oid, nid, how))
+    dropped = [pe["name"] for pe in rest if pe["id"] not in used_old]
     return matched, dropped
 
 
-def make_report(events, n_pairs, n_over, cands, extra=None) -> str:
+def make_report(events, n_pairs, n_over, cands, extra=None, limit: int = 100) -> str:
     n = len(events)
     L = [f"Событий: {n}"]
     for src, title in (("minobr", "Минобрнауки"), ("minpros", "Минпросвещения")):
@@ -443,7 +671,7 @@ def make_report(events, n_pairs, n_over, cands, extra=None) -> str:
                        ("levels", "без уровня"), ("profiles", "без профиля"),
                        ("organizer_aliases", "без псевдонимов организатора")):
         k = sum(1 for e in events if not e.get(key))
-        L.append(f"{label}: {k} ({k * 100 // n}%)")
+        L.append(f"{label}: {k} ({k * 100 // n if n else 0}%)")
     L.append("")
     L.append("Типы: " + ", ".join(f"{t} {c}" for t, c in Counter(e["type"] for e in events).most_common()))
     L.append("Уровни: " + ", ".join(f"{t} {c}" for t, c in Counter(l for e in events for l in e["levels"]).most_common()))
@@ -456,13 +684,31 @@ def make_report(events, n_pairs, n_over, cands, extra=None) -> str:
     for title, items in (extra or {}).items():
         L.append("")
         L.append(f"{title}: {len(items)}")
-        L.extend("  • " + x for x in items[:40])
-        if len(items) > 40:
-            L.append(f"  … и ещё {len(items) - 40}")
+        L.extend("  • " + x for x in items[:limit])
+        if len(items) > limit:
+            L.append(f"  … и ещё {len(items) - limit}")
     return "\n".join(L)
 
 
 # ───────────────────────── main ─────────────────────────
+
+def pick_variant(folder: Path) -> str:
+    """
+    Вариант по умолчанию: official, если есть оба minobr_official.json и
+    minpros_official.json; если есть только один — ошибка (иначе молча собрался бы
+    каталог по проектам); если нет ни одного — projects с явным сообщением.
+    """
+    have = [f for f in ("minobr_official.json", "minpros_official.json") if (folder / f).exists()]
+    if len(have) == 2:
+        return "official"
+    if len(have) == 1:
+        missing = ({"minobr_official.json", "minpros_official.json"} - set(have)).pop()
+        sys.exit(f"Есть {have[0]}, но нет {missing}. Запустите второй парсер "
+                 f"(parse_minobr.py / parse_minpros.py) или укажите --variant явно.")
+    print("ℹ Нет minobr_official.json и minpros_official.json — собираю каталог по ПРОЕКТАМ "
+          "приказов (--variant projects).")
+    return "projects"
+
 
 def main():
     ap = argparse.ArgumentParser(description="Сборка каталога для бота")
@@ -472,8 +718,7 @@ def main():
     ap.add_argument("--report", action="store_true", help="напечатать подробный отчёт")
     a = ap.parse_args()
 
-    variant = a.variant or ("official" if (HERE / "minobr_official.json").exists()
-                            and (HERE / "minpros_official.json").exists() else "projects")
+    variant = a.variant or pick_variant(HERE)
     f_mo, f_mp = HERE / f"minobr_{variant}.json", HERE / f"minpros_{variant}.json"
     for f in (f_mo, f_mp):
         if not f.exists():
@@ -483,14 +728,17 @@ def main():
 
     mo, mp = load_parsed(f_mo), load_parsed(f_mp)
     rules = load_alias_rules()
-    ov = json.loads(OVERRIDES.read_text(encoding="utf-8")) if OVERRIDES.exists() else {}
+    ov = load_overrides()
 
     seen: Dict[str, int] = {}
     events = convert_minobr(mo["events"], rules, seen) + convert_minpros(mp["events"], rules, seen)
-    n_over = apply_overrides(events, ov)
-    n_pairs = mark_in_both(events, ov.get("same_event", []))
-    validate(events)
-    matched, dropped = attach_old_ids(events, prev_path if prev_path != out_path else None)
+    unused: List[str] = []
+    n_over = apply_overrides(events, ov, unused)
+    n_pairs = mark_in_both(events, ov.get("same_event", []), unused)
+    for u in unused:
+        print("⚠ overrides.json:", u)
+    data_warn = validate(events)
+    matched, dropped = attach_old_ids(events, prev_path if prev_path.resolve() != out_path.resolve() else None)
 
     cands = fuzzy_candidates(events)
     CANDIDATES.write_text(
@@ -519,19 +767,34 @@ def main():
     out_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=1), encoding="utf-8")
 
     extra = {}
-    warnings = [f"Минобрнауки: {w}" for w in mo["warnings"]] + [f"Минпросвещения: {w}" for w in mp["warnings"]]
+    warnings = ([f"Минобрнауки: {w}" for w in mo["warnings"]] + [f"Минпросвещения: {w}" for w in mp["warnings"]]
+                + [f"каталог: {w}" for w in data_warn])
     if warnings:
         extra["Замечания к данным приказов"] = warnings
-    if matched:
+    if unused:
+        extra["overrides.json: правки, которые ни к чему не применились"] = unused
+    same = [m for m in matched if m[5] == "id"]
+    fuzzy = sorted((m for m in matched if m[5] != "id"), key=lambda t: t[2])
+    if same:
+        extra[f"Перенесены по тому же названию (сменился перечень или был дубль; сверка с {prev_path.name})"] = [
+            f"{o} → {n}  {x[:80]}" for x, y, r, o, n, k in same]
+    if fuzzy:
         extra[f"Переименованные мероприятия (старый id сохранён в old_ids, сверка с {prev_path.name})"] = [
-            f"{r:.2f}  {x[:70]}  →  {y[:70]}" for x, y, r in sorted(matched, key=lambda t: t[2])]
+            f"{r:.2f}{' (вхождение)' if k == 'contain' else ''}  {x[:70]}  →  {y[:70]}"
+            for x, y, r, o, n, k in fuzzy]
     if dropped:
         extra[f"Были в {prev_path.name}, нет в новом каталоге (их избранное не перенесётся)"] = dropped
     rep = make_report(events, n_pairs, n_over, cands, extra)
     REPORT.write_text(rep, encoding="utf-8")
     print(rep if a.report else rep.split("\n\n")[0])
     if matched or dropped:
-        print(f"Сверка с {prev_path.name}: переименовано {len(matched)}, пропало {len(dropped)}")
+        print(f"Сверка с {prev_path.name}: тот же id-хэш {len(same)}, переименовано {len(fuzzy)}, "
+              f"пропало {len(dropped)}")
+        low = [m for m in fuzzy if m[2] < 0.95]
+        if low:
+            print("Нечёткие сопоставления с оценкой < 0.95 — проверьте:")
+            for x, y, r, o, n, k in low:
+                print(f"  {r:.3f} {k:7} {x[:60]}  →  {y[:60]}")
     print(f"Сохранено → {out_path.name}")
 
 
